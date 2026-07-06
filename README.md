@@ -4,4 +4,4 @@ So I made this script, which splits the image up into tiles, and clips the indiv
 
 This script takes advantage of being able to easily make multithread calls of gdalwarp from pyqgis
 
-I kid you not, my image went from taking more than a weekend to clip, to only taking about an hour
+I kid you not, my image went from taking more than a weekend to clip, to only taking about 1.5 hours
