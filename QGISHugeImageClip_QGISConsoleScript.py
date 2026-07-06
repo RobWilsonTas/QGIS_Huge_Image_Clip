@@ -4,8 +4,6 @@ from qgis.core import QgsRasterLayer
 from qgis.PyQt.QtWidgets import QMessageBox
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-startTime = time.time()
-
 
 """
 ##########################################################
