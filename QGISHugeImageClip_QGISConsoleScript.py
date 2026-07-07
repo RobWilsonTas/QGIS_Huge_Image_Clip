@@ -1,7 +1,6 @@
-import numpy, subprocess, os, glob, time, shutil, re
+import subprocess, os, glob, time, shutil, re
 from pathlib import Path
 from qgis.core import QgsRasterLayer
-from qgis.PyQt.QtWidgets import QMessageBox
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 startTime = time.time()
@@ -30,6 +29,7 @@ Variable assignment for processing
 #Define the location of gdal and make sure its windows don't appear a hundred times
 gdalwarpExe = str(Path(QgsApplication.prefixPath()).parent.parent / 'bin' / 'gdalwarp.exe')
 gdalTranslateExe = str(Path(QgsApplication.prefixPath()).parent.parent / 'bin' / 'gdal_translate.exe')
+gdalOverviewsExe = str(Path(QgsApplication.prefixPath()).parent.parent / 'bin' / 'gdaladdo.exe')
 startupinfo = subprocess.STARTUPINFO()
 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 startupinfo.wShowWindow = subprocess.SW_HIDE
@@ -215,6 +215,6 @@ os.system(cmdLine)
 
 #Build pyramids
 print("Final image clipped, building pyramids")
-processing.run("gdal:overviews", {'INPUT':finalImage,'CLEAN':False,'LEVELS':'','RESAMPLING':3,'FORMAT':1,
-    'EXTRA':'--config COMPRESS_OVERVIEW WEBP --config WEBP_LEVEL_OVERVIEW 50'})
+subprocess.Popen([gdalOverviewsExe, "--config", "COMPRESS_OVERVIEW", "WEBP", "--config", "WEBP_LEVEL_OVERVIEW", "50", "-r", "cubic", "-ro", finalImage],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.DETACHED_PROCESS)
 
