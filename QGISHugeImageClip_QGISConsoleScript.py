@@ -70,6 +70,8 @@ pixelSizeX = ras.rasterUnitsPerPixelX()
 pixelSizeY = ras.rasterUnitsPerPixelY()
 pixelSizeAve = (pixelSizeX + pixelSizeY) / 2
 coordinateSystem = ras.crs().authid()
+if coordinateSystem == '':
+    raise Exception('Raster is missing a crs?')
 
 #Clear out the folders
 for folder in [processDirectory, processExtentBoundsDirectory, processClipBoundsDirectory, processTileDirectory]:
