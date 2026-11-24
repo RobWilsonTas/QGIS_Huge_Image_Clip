@@ -1,222 +1,103 @@
-import subprocess, os, glob, time, shutil, re
-from pathlib import Path
+# Run in the QGIS Python console to clip the input raster and write a tiled WebP GeoTIFF.
+from math import ceil, floor
+from time import perf_counter
+from osgeo import gdal
 from qgis.core import QgsRasterLayer
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
-startTime = time.time()
 
+#Choosing the inputs for the clipping
+clipPath, _ = QFileDialog.getOpenFileName(None, "Select clipping vector", "", "Vector files (*.gpkg *.shp);;All files (*.*)")
+rasterPath, _ = QFileDialog.getOpenFileName(None, "Select input raster", "", "Raster files (*.tif *.tiff *.img);;All files (*.*)")
+rasterLayer = QgsRasterLayer(rasterPath, 'input')
+outputPath = os.path.join(os.path.dirname(rasterPath), os.path.splitext(os.path.basename(rasterPath))[0] + "_Clipped.tif")
 
-"""
-##########################################################
-User options
-"""
-
-#Variable assignment
-approxPixelsPerTile     = 4000
-compressOptions         = 'COMPRESS=ZSTD|NUM_THREADS=ALL_CPUS|PREDICTOR=1|ZSTD_LEVEL=1|BIGTIFF=IF_SAFER|TILED=YES'
-gdalOptions             = '-co COMPRESS=ZSTD -co ZSTD_LEVEL=1 -co PREDICTOR=2 -co NUM_THREADS=ALL_CPUS -co BIGTIFF=IF_SAFER -co TILED=YES --config GDAL_NUM_THREADS ALL_CPUS -multi -wo NUM_THREADS=ALL_CPUS -overwrite'
-gdalOptionsFinal        = '-co COMPRESS=WEBP -co WEBP_LEVEL=75 -co PREDICTOR=2 -co NUM_THREADS=ALL_CPUS -co BIGTIFF=IF_SAFER -co TILED=YES -multi --config GDAL_NUM_THREADS ALL_CPUS -wo NUM_THREADS=ALL_CPUS -overwrite'
-
-#Prompting the user to choose an image and clipping vector
-inImage = QFileDialog.getOpenFileName(None, "Select image file", "", "Raster Files (*.tif *.tiff *.ecw *.jp2)")[0]
-clippingVector = QFileDialog.getOpenFileName(None, "Select clipping vector", "", "Vector Files (*.gpkg *.shp *.geojson)")[0]
+#WebP quality ranges from 1-100. Lower values produce smaller files.
+webpQuality = 1
+workerCount = 64
+tileSize = 512
 
 """
-##################################################################################
-Variable assignment for processing
+######################################################################
 """
 
-#Define the location of gdal and make sure its windows don't appear a hundred times
-gdalwarpExe = str(Path(QgsApplication.prefixPath()).parent.parent / 'bin' / 'gdalwarp.exe')
-gdalTranslateExe = str(Path(QgsApplication.prefixPath()).parent.parent / 'bin' / 'gdal_translate.exe')
-gdalOverviewsExe = str(Path(QgsApplication.prefixPath()).parent.parent / 'bin' / 'gdaladdo.exe')
-startupinfo = subprocess.STARTUPINFO()
-startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-startupinfo.wShowWindow = subprocess.SW_HIDE
+creationOptions = ['TILED=YES', 'BLOCKXSIZE=' + str(tileSize), 'BLOCKYSIZE=' + str(tileSize), 'COMPRESS=WEBP',
+    'WEBP_LEVEL=' + str(webpQuality), 'WEBP_LOSSLESS=NO', 'NUM_THREADS=' + str(workerCount), 'BIGTIFF=IF_SAFER',]
 
-#Get the location of the initial image for storage of processing files
-rootProcessDirectory = str(Path(inImage).parent.absolute()).replace('\\','/') + '/'
+#Set up gdal and load in the raster
+gdal.UseExceptions()
+gdal.SetConfigOption('GDAL_NUM_THREADS', str(workerCount))
+startTime = perf_counter()
+sourceDataset = gdal.Open(rasterLayer.source().split('|')[0])
+geoTransform = sourceDataset.GetGeoTransform()
 
-#Set up the layer name for the raster calculations
-inImageName = Path(inImage).stem[:13]
-outImageName = inImageName
+#This script expects an 8-bit RGB or RGBA raster.
+#Only the first three bands are used as RGB, with a new alpha band generated from the clipping polygon.
+if sourceDataset.RasterCount not in (3, 4) or sourceDataset.GetRasterBand(1).DataType != gdal.GDT_Byte:
+    raise ValueError('Expected an 8-bit raster with three or four bands; only bands 1-3 are used.')
 
-#Make folders for processing
-processDirectoryInstance        = rootProcessDirectory + inImageName + 'Process' + '/'
-processDirectory                = processDirectoryInstance + '1Main/'
-processExtentBoundsDirectory    = processDirectoryInstance + '2TileExtentBounds/'
-processClipBoundsDirectory      = processDirectoryInstance + '3TileClipBounds/'
-processTileDirectory            = processDirectoryInstance + '4Tiles/'
-processMosaicStagingDirectory   = processDirectoryInstance + '5MosaicStaging/'
-finalImageDir                   = processDirectoryInstance + '6Final/'
+#Use the raster's coordinate system for the clipping operation.
+sourceCrs = rasterLayer.crs().toWkt() if rasterLayer.crs().isValid() else sourceDataset.GetProjection()
+if not sourceCrs:
+    raise ValueError('Assign a coordinate system to the input layer in QGIS first.')
 
-#Creating all the subfolders
-if not os.path.exists(processDirectoryInstance):        os.mkdir(processDirectoryInstance)
-if not os.path.exists(processDirectory):                os.mkdir(processDirectory)
-if not os.path.exists(processExtentBoundsDirectory):    os.mkdir(processExtentBoundsDirectory)
-if not os.path.exists(processClipBoundsDirectory):      os.mkdir(processClipBoundsDirectory)
-if not os.path.exists(processTileDirectory):            os.mkdir(processTileDirectory)
-if not os.path.exists(processMosaicStagingDirectory):   os.mkdir(processMosaicStagingDirectory)
-if not os.path.exists(finalImageDir):                   os.mkdir(finalImageDir)
+#Reproject the clipping vector into the raster's CRS and load it into memory.
+clipDataset = gdal.VectorTranslate('', clipPath, format='MEM', dstSRS=sourceCrs, geometryType='MULTIPOLYGON')
+clipLayer = clipDataset.GetLayer(0)
 
-"""
-####################################################################################
-Final preps for processing
-"""
+#Get the outer bounding extent of the clipping geometry.
+clipMinX, clipMaxX, clipMinY, clipMaxY = clipLayer.GetExtent()
 
-#Get the pixel size and coordinate system of the raster
-ras = QgsRasterLayer(inImage)
-pixelSizeX = ras.rasterUnitsPerPixelX()
-pixelSizeY = ras.rasterUnitsPerPixelY()
-pixelSizeAve = (pixelSizeX + pixelSizeY) / 2
-coordinateSystem = ras.crs().authid()
-if coordinateSystem == '':
-    raise Exception('Raster is missing a crs?')
+#Convert the clipping extent from map coords into raster pixel positions
+clipLeftPixel = max(0, floor((clipMinX - geoTransform[0]) / geoTransform[1]))
+clipRightPixel = min(sourceDataset.RasterXSize, ceil((clipMaxX - geoTransform[0]) / geoTransform[1]))
+clipTopPixel = max(0, floor((clipMaxY - geoTransform[3]) / geoTransform[5]))
+clipBottomPixel = min(sourceDataset.RasterYSize, ceil((clipMinY - geoTransform[3]) / geoTransform[5]))
 
-#Clear out the folders
-for folder in [processDirectory, processExtentBoundsDirectory, processClipBoundsDirectory, processTileDirectory]:
-    for file in glob.glob(folder + '*'):
-        try:
-            os.remove(file)
-        except BaseException as e:
-            print(e)
+#Calculate the dimensions of the cropped raster, and stop the script if there is no overlap
+outputWidth = clipRightPixel - clipLeftPixel
+outputHeight = clipBottomPixel - clipTopPixel
+if outputWidth <= 0 or outputHeight <= 0:
+    raise ValueError('The clip polygon does not overlap the raster.')
 
-"""
-###############################################################################################
-Get all of the tile extents sorted out
-"""
+#Calculate the coordinates of the top-left corner pixel in the output raster
+outputOriginX = geoTransform[0] + clipLeftPixel * geoTransform[1]
+outputOriginY = geoTransform[3] + clipTopPixel * geoTransform[5]
 
-#Determine the extent and coordinate system of the extent
-processing.run("native:polygonfromlayerextent", {'INPUT':inImage,'ROUND_TO':0,'OUTPUT':processDirectory + inImageName + 'ImageExtent.gpkg'})
-extentVector = QgsVectorLayer(processDirectory + inImageName + 'ImageExtent.gpkg')
-extentRectangle = extentVector.extent()
-extentCrs = extentVector.sourceCrs()
+#Create an empty output raster with four 8-bit bands: red, green, blue and alpha, ready to be filled
+outputDataset = gdal.GetDriverByName('GTiff').Create(str(outputPath), outputWidth, outputHeight, 4, gdal.GDT_Byte, creationOptions)
+outputDataset.SetGeoTransform((outputOriginX, geoTransform[1], 0, outputOriginY, 0, geoTransform[5]))
+outputDataset.SetProjection(sourceCrs)
+colorTypes = (gdal.GCI_RedBand, gdal.GCI_GreenBand, gdal.GCI_BlueBand, gdal.GCI_AlphaBand)
+for bandNumber, colorType in enumerate(colorTypes, 1):
+    outputDataset.GetRasterBand(bandNumber).SetColorInterpretation(colorType)
 
-#Then close the layer object so that QGIS doesn't unnecessarily hold on to it
-QgsProject.instance().addMapLayer(extentVector, False)
-QgsProject.instance().removeMapLayer(extentVector.id())
-
-#Create a grid for dividing the image up into tiles
-processing.run("native:creategrid", {'TYPE':2,'EXTENT':extentRectangle,'HSPACING':pixelSizeX * approxPixelsPerTile,
-    'VSPACING':pixelSizeY * approxPixelsPerTile,'HOVERLAY':0,'VOVERLAY':0,'CRS':extentCrs,
-    'OUTPUT':processDirectory + inImageName + 'ImageExtentGrid.gpkg'})
-
-#Clip this so we're not overrunning into areas where the image isn't
-processing.run("native:clip", {'INPUT':processDirectory + inImageName + 'ImageExtentGrid.gpkg',
-    'OVERLAY':processDirectory + inImageName + 'ImageExtent.gpkg', 'OUTPUT':processDirectory + inImageName + 'ImageExtentGridClip.gpkg'})
-
-#Only keep the tiles that actually touch the clipping vector
-processing.run("native:extractbylocation", {'INPUT':processDirectory + inImageName + 'ImageExtentGridClip.gpkg',
-    'PREDICATE':[0],'INTERSECT':clippingVector,'OUTPUT':processDirectory + inImageName + 'ImageExtentGridClipGrabbed.gpkg'})
-
-#Build a unique id with the row number defined
-processing.run("native:fieldcalculator", {'INPUT':processDirectory + inImageName + 'ImageExtentGridClipGrabbed.gpkg','FIELD_NAME':'TileId',
-    'FIELD_TYPE':2,'FIELD_LENGTH':0,'FIELD_PRECISION':0,'FORMULA':' ("row_index"+1)|| \'_\' ||("col_index" +1)','OUTPUT':processDirectory + inImageName + 'ImageExtentGridClipGrabbedIded.gpkg'})
-
-#Split out the tiles into individual files to define the extent of the tiles
-processing.run("native:splitvectorlayer", {'INPUT':processDirectory + inImageName + 'ImageExtentGridClipGrabbedIded.gpkg',
-    'FIELD':'TileId','FILE_TYPE':0,'OUTPUT':processExtentBoundsDirectory})
-
-#Now clip the grid so that it's only the area we actually want
-processing.run("native:clip", {'INPUT':processDirectory + inImageName + 'ImageExtentGridClipGrabbedIded.gpkg',
-    'OVERLAY':clippingVector, 'OUTPUT':processDirectory + inImageName + 'ImageExtentGridClipGrabbedIdedClip.gpkg'})
-
-#Split it out so there is a different extent to work from for each instance of the raster clipping
-processing.run("native:splitvectorlayer", {'INPUT':processDirectory + inImageName + 'ImageExtentGridClipGrabbedIdedClip.gpkg',
-    'FIELD':'TileId','FILE_TYPE':0,'OUTPUT':processClipBoundsDirectory})
-
-"""
-#################################################################################################
-Slice up the raster based on the tiles and the cutting vector
-"""
-
-boundsFiles = glob.glob(processClipBoundsDirectory + '/*.gpkg')
-
-def clipTile(boundClipFile):
-    try:
-        boundName = Path(boundClipFile).stem
-        outputFile = processTileDirectory + boundName + 'Tile.tif'
-
-        #Get the extent of the tile
-        tileExtentVector = QgsVectorLayer(processExtentBoundsDirectory + boundName + '.gpkg')
-        tileExtentRectangle = tileExtentVector.extent()
-
-        #Prep a line for cmd where we are clipping the content to the clip vector, but the extent to the whole tile
-        cmdLine = (gdalwarpExe + ' -cutline "' + boundClipFile + '" -of GTiff -te ' +
-            str(tileExtentRectangle.xMinimum()) + " " + str(tileExtentRectangle.yMinimum()) + " " + str(tileExtentRectangle.xMaximum()) + " " + str(tileExtentRectangle.yMaximum()) +
-            " " + gdalOptions + ' "' + inImage + '" "' + outputFile + '"')
-        
-        #Run the cmd line, hopefully with no errors
-        result = subprocess.run(cmdLine, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, startupinfo=startupinfo)
-        print(result.stderr, flush=True)
-        print(result.stdout, flush=True)
-        
-        #Sometimes dumbass handles screw things up
-        QgsProject.instance().addMapLayer(tileExtentVector, False)
-        QgsProject.instance().removeMapLayer(tileExtentVector.id())
+#Go through each row of tiles, in order to keep memory usage from blowing up
+tileRowCount = (outputHeight + tileSize - 1) // tileSize
+for tileRowNumber in range(tileRowCount):
     
-    except BaseException as e:
-        print(boundName + " error: " + str(e))
+    #Within the workspace of the entire output raster, work out the position of the current row
+    stripTopPixel = tileRowNumber * tileSize
+    stripHeight = min(tileSize, outputHeight - stripTopPixel)
 
-#Run in parallel with threads so we get heaps done at once
-with ThreadPoolExecutor(max_workers=8) as executor:
-    for result in executor.map(clipTile, boundsFiles):
-        print('Tile done', flush=True)
+    #Create a temporary in-memory raster to hold the clipping mask for this row
+    #This is to be a very long thin raster with values of 0 and 255
+    maskDataset = gdal.GetDriverByName('MEM').Create('', outputWidth, stripHeight, 1, gdal.GDT_Byte)
+    maskDataset.SetProjection(sourceCrs)
+    maskDataset.SetGeoTransform((outputOriginX, geoTransform[1], 0, outputOriginY + stripTopPixel * geoTransform[5], 0, geoTransform[5]))
 
-print("All tiles clipped")
+    #Burn a value of 255 into the mask
+    clipLayer.ResetReading()
+    gdal.RasterizeLayer(maskDataset, [1], clipLayer, burn_values=[255])
 
-"""
-###################################################################################################################
-Mosaic staging, so that we can leverage multi threading to get even closer to the final image
-"""
+    #Write the rgb and the alpha to the output
+    alphaBytes = maskDataset.GetRasterBand(1).ReadRaster()
+    rgbBytes = sourceDataset.ReadRaster(clipLeftPixel, clipTopPixel + stripTopPixel, outputWidth, stripHeight, band_list=[1, 2, 3])
+    outputDataset.WriteRaster(0, stripTopPixel, outputWidth, stripHeight, rgbBytes + alphaBytes)
 
-#Get a list of the tiles
-boundsFiles = glob.glob(processTileDirectory + '/*.tif')
+    print('Done tile row ' + str(tileRowNumber + 1) + ' of ' + str(tileRowCount), flush=True)
 
-#Go through all of the tiles and group them up by the row id
-groups = {}
-for f in boundsFiles:
-    match = re.search(r"TileId_(\d+)_", f)
-    if match:
-        key = int(match.group(1))
-        groups.setdefault(key, []).append(f)
-boundsFilesLists = [groups[k] for k in sorted(groups)]
+#Close the datasets by releasing their references, ensuring the output is flushed to disk.
+outputDataset = None
+clipLayer = clipDataset = sourceDataset = None
 
-#Define a function to mosaic each row of tiles together
-def firstStageMosaic(fileList):
-    baseName = os.path.splitext(os.path.basename(fileList[0]))[0]
-    firstStageMosaicOutput = processMosaicStagingDirectory + baseName + '.tif'
-
-    #Make a list of all the input files
-    inputFiles = " ".join(['"' + f + '"' for f in fileList])
-    cmdLine = 'gdalwarp -of GTiff ' + gdalOptions + ' ' + inputFiles + ' "' + firstStageMosaicOutput + '"'
-    
-    #Run the cmd
-    result = subprocess.run(cmdLine, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, startupinfo=startupinfo)
-    print(result.stderr, flush=True)
-    print(result.stdout, flush=True)
-
-#Thread it up
-with ThreadPoolExecutor(max_workers=8) as executor:
-    for _ in executor.map(firstStageMosaic, boundsFilesLists):
-        print("Batch done", flush=True)
-
-"""
-#############################################################################################
-Finally bring it all together into a final mosaic
-"""
-
-#Prepare to make a final mosaic where the alpha bands are respected
-finalImageDir = finalImageDir.replace("/", "\\")
-processMosaicStagingDirectory = processMosaicStagingDirectory.replace("/", "\\")
-
-#Final mosaicking of the tiles
-finalImage = finalImageDir + outImageName + datetime.now().strftime("%Y%m%d%H%M") + '.tif'
-cmdLine = 'gdalwarp -of GTiff ' + gdalOptionsFinal + ' "' + processMosaicStagingDirectory + '**.tif" "' + finalImage + '" & timeout 5'
-os.system(cmdLine)
-
-#Build pyramids
-print("Final image clipped, building pyramids")
-subprocess.Popen([gdalOverviewsExe, "--config", "COMPRESS_OVERVIEW", "WEBP", "--config", "WEBP_LEVEL_OVERVIEW", "50", "-r", "cubic", "-ro", finalImage],
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.DETACHED_PROCESS)
-
+#Report the total processing time and output location.
+print('Done in {:.2f} seconds: {}'.format(perf_counter() - startTime, outputPath), flush=True)
